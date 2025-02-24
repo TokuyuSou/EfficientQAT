@@ -29,7 +29,7 @@ def update_dataset(layer, dataset, dev, attention_mask, position_ids):
                 new_data = layer(inps, attention_mask=attention_mask,position_ids=position_ids)[0].to('cpu')
                 dataset.update_data(index,new_data)
 
-                    
+
 def block_ap(
     model,
     args,
@@ -40,11 +40,11 @@ def block_ap(
     logger.info("Starting ...")
     if args.off_load_to_disk:
         logger.info("offload the training dataset to disk, saving CPU memory, but may slowdown the training due to additional I/O...")
-    
+
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    
+
     # step 1: move embedding layer and first layer to target device, only suppress llama models now
     layers = model.model.layers
     model.model.embed_tokens = model.model.embed_tokens.to(dev)
@@ -74,8 +74,8 @@ def block_ap(
                                 model.config.hidden_size, args.batch_size, dtype, cache_path=fp_train_cache_path,off_load_to_disk=args.off_load_to_disk)
     fp_val_inps = BlockTrainDataset(args.val_size, args.training_seqlen, 
                                 model.config.hidden_size, args.batch_size, dtype, cache_path=fp_val_cache_path,off_load_to_disk=args.off_load_to_disk)
-    
-    # step 3: catch the input of thefirst layer 
+
+    # step 3: catch the input of thefirst layer
     class Catcher(nn.Module):
         def __init__(self, module, dataset):
             super().__init__()
@@ -93,7 +93,7 @@ def block_ap(
             if self.position_ids is None:
                 self.position_ids = kwargs["position_ids"]
             raise ValueError
-    
+
     # step 3.1: catch the input of training set
     layers[0] = Catcher(layers[0],fp_train_inps)
     iters = len(trainloader)//args.batch_size
@@ -127,7 +127,7 @@ def block_ap(
             " Seems that model's attention works without a mask."
         )
         attention_mask_batch = None
-    
+
     # step 4: move embedding layer and first layer to cpu
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
@@ -156,7 +156,7 @@ def block_ap(
         for index,data in enumerate(fp_val_inps):
             quant_val_inps.update_data(index, data)
 
-    # step 6: start training    
+    # step 6: start training
     loss_func = torch.nn.MSELoss()
     for block_index in range(len(layers)):
         logger.info(f"=== Start quantize blocks {block_index}===")
@@ -169,16 +169,14 @@ def block_ap(
                 set_op_by_name(qlayer, name, quantlinear)  
                 del module  
         qlayer.to(dev)
-        
-        
+
         # step 6.2: obtain output of full-precision model for MSE
         set_quant_state(qlayer,weight_quant=False) # deactivate quantization for obtaining ground truth
         if args.epochs > 0:
             update_dataset(qlayer,fp_train_inps,dev,attention_mask,position_ids)
             update_dataset(qlayer,fp_val_inps,dev,attention_mask,position_ids)
         set_quant_state(qlayer,weight_quant=True)  # activate quantization
-        
-        
+
         if args.epochs > 0:
             with torch.no_grad():
                 qlayer.float()      # fp32 is required for AMP training
@@ -196,7 +194,7 @@ def block_ap(
                 param_group_index += 1
             else:
                 set_quant_parameters(qlayer,False)
-                
+
             if args.weight_lr > 0:
                 set_weight_parameters(qlayer,True)
                 param.append({"params":weight_parameters(qlayer),"lr":args.weight_lr})
@@ -221,18 +219,30 @@ def block_ap(
                 for index, (quant_inps, fp_inps) in enumerate(zip(quant_train_inps, fp_train_inps)):    
                     # obtain output of quantization model
                     with torch.cuda.amp.autocast():
+                        # Calculate reconstruction loss
                         input = quant_inps.to(dev)
                         label = fp_inps.to(dev)
                         quant_out = qlayer(input, attention_mask=attention_mask_batch,position_ids=position_ids)[0]
                         reconstruction_loss = loss_func(label, quant_out)
-                        loss =  reconstruction_loss
 
-                    if not math.isfinite(loss.item()):
+                        # Calculate penalty term (weight preservation)
+                        reg_loss = 0
+                        if args.lambda_reg > 0:
+                            for name, module in qlayer.named_modules():
+                                if isinstance(module, int_linear_fake.QuantLinear):
+                                    if module.weight_q is None:
+                                        raise ValueError(
+                                            "quantized weight should be set. Something is wrong."
+                                        )
+                                    reg_loss += F.mse_loss(module.weight_q, module.weight)
+                        total_loss = reconstruction_loss + args.lambda_reg * reg_loss
+
+                    if not math.isfinite(total_loss.item()):
                         logger.info("Loss is NAN, stopping training")
                         pdb.set_trace()
-                    loss_list.append(reconstruction_loss.detach().cpu())
+                    loss_list.append(total_loss.detach().cpu())
                     optimizer.zero_grad()
-                    norm = loss_scaler(loss, optimizer,parameters=trainable_parameters(qlayer)).cpu()
+                    norm = loss_scaler(total_loss, optimizer,parameters=trainable_parameters(qlayer)).cpu()
                     norm_list.append(norm.data)
 
                     # adjust lr
@@ -249,12 +259,24 @@ def block_ap(
                     # obtain output of quantization model
                     with torch.no_grad():
                         with torch.cuda.amp.autocast():
+                            # Calculate reconstruction loss
                             input = quant_inps.to(dev)
                             label = fp_inps.to(dev)
                             quant_out = qlayer(input, attention_mask=attention_mask_batch,position_ids=position_ids)[0]
                             reconstruction_loss = loss_func(label, quant_out)
-                    val_loss_list.append(reconstruction_loss.cpu())
-                 
+                            # Calculate penalty term (weight preservation)
+                            reg_loss = 0
+                            if args.lambda_reg > 0:
+                                for name, module in qlayer.named_modules():
+                                    if isinstance(module, int_linear_fake.QuantLinear):
+                                        if module.weight_q is None:
+                                            raise ValueError(
+                                                "quantized weight should be set. Something is wrong."
+                                            )
+                                        reg_loss += F.mse_loss(module.weight_q, module.weight)
+                            total_loss = reconstruction_loss + args.lambda_reg * reg_loss
+                    val_loss_list.append(total_loss.cpu())
+
                 train_mean_num = min(len(loss_list),64) # calculate the average training loss of last train_mean_num samples
                 loss_mean = torch.stack(loss_list)[-(train_mean_num-1):].mean()
                 val_loss_mean = torch.stack(val_loss_list).mean()
@@ -308,4 +330,3 @@ def block_ap(
     gc.collect()                    
     model.config.use_cache = use_cache
     return model
-

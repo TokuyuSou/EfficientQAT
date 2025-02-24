@@ -34,11 +34,15 @@ class QuantLinear(nn.Module):
         self.weight_quantizer = UniformAffineQuantizer(wbits, group_size, weight=org_module.weight)
         self.use_temporary_parameter = False
 
+        # Cache the (de)quantized weight
+        self.weight_q = None
+
     
     
     def forward(self, input: torch.Tensor):
         if self.use_weight_quant:
-            weight = self.weight_quantizer(self.weight)
+            self.weight_q = self.weight_quantizer(self.weight)
+            weight = self.weight_q
             bias = self.bias
         else:
             weight = self.weight
